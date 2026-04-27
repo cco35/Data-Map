@@ -43,6 +43,16 @@ except ImportError:
 #  PARSING
 # ─────────────────────────────────────────────
 
+def _strip_namespaces(content: bytes) -> bytes:
+    """Remove XML namespace declarations so ElementTree xpath works."""
+    import re as _re
+    # Remove xmlns='...' and xmlns="..." attributes (single or double quotes)
+    content = _re.sub(rb'\s+xmlns(?::\w+)?=[^\s>]+', b'', content)
+    # Strip namespace prefixes: <ns:tag> -> <tag>, </ns:tag> -> </tag>
+    content = _re.sub(rb'<(/?)\w+:([\w\-]+)', rb'<\1\2', content)
+    return content
+
+
 def get_twb_tree(filepath: Path):
     if filepath.suffix.lower() == ".twbx":
         with zipfile.ZipFile(filepath, "r") as zf:
@@ -50,8 +60,10 @@ def get_twb_tree(filepath: Path):
             if not inner:
                 raise ValueError(f"No .twb found inside {filepath.name}")
             with zf.open(inner[0]) as f:
-                return ET.parse(f)
-    return ET.parse(filepath)
+                content = _strip_namespaces(f.read())
+        return ET.ElementTree(ET.fromstring(content))
+    content = _strip_namespaces(filepath.read_bytes())
+    return ET.ElementTree(ET.fromstring(content))
 
 
 def extract_datasource_info(ds_element):
@@ -167,13 +179,13 @@ def parse_workbook(filepath: Path):
     rows = []
 
     datasources = {}
-    for ds in root.findall(".//datasources/datasource"):
+    for ds in root.findall("datasources/datasource"):
         name = ds.get("name", "")
         if name.lower() in ("parameters", ""):
             continue
         datasources[name] = extract_datasource_info(ds)
 
-    for ws in root.findall(".//worksheets/worksheet"):
+    for ws in root.findall("worksheets/worksheet"):
         ws_name = ws.get("name", "Unknown Sheet")
         deps = set()
         for dep in ws.findall(".//datasource-dependencies"):
