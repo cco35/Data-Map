@@ -1,5 +1,5 @@
 """
-Tableau Lineage Mapper v6
+Tableau Lineage Mapper v5
 =========================
 Parses .twb/.twbx files — no Tableau Server required.
 
@@ -9,13 +9,10 @@ Five tabs:
   3. Impact Analysis  — Search a datasource/table, see every worksheet affected
   4. Cleanup          — No-source worksheets + duplicate datasource usage
   5. Diagrams         — Left-to-right family tree per workbook (Green→Blue→Coral)
-                        Improved Snowflake view detection so views are never grey
 
 Outputs:
-  - tableau_lineage.xlsx  — Formatted Excel workbook with auto-fit columns,
-                            frozen header row, colour-coded object types,
-                            alternating row shading, and a summary sheet
-  - tableau_lineage.html  — Interactive HTML report (all five tabs)
+  - tableau_lineage.xlsx  — Formatted Excel workbook
+  - tableau_lineage.html  — Interactive HTML report
 
 Usage:
     python tableau_lineage_mapper.py --folder /path/to/twb/files
@@ -40,24 +37,29 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────
-#  PARSING
+#  NAMESPACE STRIPPING
 # ─────────────────────────────────────────────
 
 def _strip_namespaces(content: bytes) -> bytes:
     """
-    Remove XML namespace declarations and prefixes from raw .twb XML bytes
+    Remove XML namespace declarations and prefixes from raw .twb bytes
     so that ElementTree xpath queries work with plain unprefixed tag names.
+    Handles both single- and double-quoted xmlns attributes.
     """
-    import re as _re
     # Remove xmlns="..." double-quoted
-    content = _re.sub(rb'\s+xmlns(?::\w+)?="[^"]*"', b'', content)
+    content = re.sub(rb'\s+xmlns(?::\w+)?="[^"]*"', b'', content)
     # Remove xmlns='...' single-quoted
-    content = _re.sub(rb"\s+xmlns(?::\w+)?='[^']*'", b'', content)
+    content = re.sub(rb"\s+xmlns(?::\w+)?='[^']*'", b'', content)
     # Strip prefixes from tags: <ns:tag> -> <tag>, </ns:tag> -> </tag>
-    content = _re.sub(rb'<(/?)[\w][\w.-]*:([\w][\w.-]*)', rb'<\1\2', content)
+    content = re.sub(rb'<(/?)[\w][\w.-]*:([\w][\w.-]*)', rb'<\1\2', content)
     # Strip prefixes from attributes: ns:attr="v" -> attr="v"
-    content = _re.sub(rb' [\w][\w.-]*:([\w][\w.-]*)=', rb' \1=', content)
+    content = re.sub(rb' [\w][\w.-]*:([\w][\w.-]*)=', rb' \1=', content)
     return content
+
+
+# ─────────────────────────────────────────────
+#  PARSING
+# ─────────────────────────────────────────────
 
 def get_twb_tree(filepath: Path):
     if filepath.suffix.lower() == ".twbx":
@@ -79,102 +81,53 @@ def extract_datasource_info(ds_element):
         "db_type": "", "server": "", "database": "", "schema": "",
         "table": "", "custom_sql": "", "is_view": False,
     }
+    conn = ds_element.find(".//connection")
+    if conn is not None:
+        info["db_type"]  = conn.get("class", conn.get("dbclass", "")).lower()
+        info["server"]   = conn.get("server", "")
+        info["database"] = conn.get("dbname", conn.get("database", ""))
+        info["schema"]   = conn.get("schema", "")
 
-    # ── Step 1: Named connections (federated/published Snowflake datasources) ──
-    # These are the most common structure when publishing from Tableau Desktop.
-    # The outer <connection class='federated'> is useless — the real info is
-    # on the inner <connection> inside each <named-connection>.
-    for nc in ds_element.findall(".//named-connections/named-connection"):
-        c = nc.find("connection")
-        if c is not None:
-            cls = c.get("class", c.get("dbclass", "")).lower()
-            if cls and cls != "federated":
-                info["db_type"]  = cls
-                info["server"]   = c.get("server", "")
-                info["database"] = c.get("dbname",  c.get("database", ""))
-                info["schema"]   = c.get("schema",  "")
-                break  # use first non-federated named connection
-
-    # ── Step 2: Direct <connection> (non-federated / live direct connections) ──
-    # Only use this if named-connections didn't already give us a real db_type.
-    if not info["db_type"]:
-        conn = ds_element.find(".//connection")
-        if conn is not None:
-            cls = conn.get("class", conn.get("dbclass", "")).lower()
-            if cls and cls != "federated":
-                info["db_type"]  = cls
-                info["server"]   = conn.get("server", "")
-                info["database"] = conn.get("dbname", conn.get("database", ""))
-                info["schema"]   = conn.get("schema", "")
-
-    # ── Step 3: Table/view from <relation> tags ──
-    for rel in ds_element.findall(".//relation[@type='table']"):
-        tbl = rel.get("table", "").strip("[]")
+    rel_table = ds_element.find(".//relation[@type='table']")
+    if rel_table is not None:
+        tbl = rel_table.get("table", "").strip("[]")
         if tbl:
             info["table"] = tbl
             name_upper = tbl.upper()
-            if (rel.get("view", "") == "true"
+            if (rel_table.get("view", "") == "true"
                     or name_upper.endswith("_VIEW")
                     or name_upper.endswith("_VW")
                     or name_upper.startswith("V_")
                     or name_upper.startswith("VW_")):
                 info["is_view"] = True
-            break
 
-    # ── Step 4: Custom SQL ──
     rel_sql = ds_element.find(".//relation[@type='text']")
     if rel_sql is not None and rel_sql.text:
         info["table"]      = "[Custom SQL]"
         info["custom_sql"] = rel_sql.text.strip()
 
-    # ── Step 5: Fallback — any relation with a table attribute ──
-    if not info["table"] and not info["custom_sql"]:
+    if not info["table"]:
         for rel in ds_element.findall(".//relation"):
             tbl = rel.get("table", "")
             if tbl:
                 info["table"] = tbl.strip("[]")
                 break
 
-    # ── Step 6: Published datasource — parse caption for table & schema ──
-    # Published datasources (name starts with 'federated.') often have no
-    # <relation> at all. Tableau encodes the info in the caption like:
-    #   "V_CAD-APPLICATIONS (F1_DEVOPS.V_CAD-APPLICATIONS) (PUBLISHED)"
-    # We extract the part inside the first parentheses as DB.SCHEMA.TABLE or
-    # DB.TABLE, and the object name itself as the table.
-    if not info["table"]:
-        caption = info["ds_caption"]
-        if caption:
-            # Pattern: anything followed by (DB.SCHEMA.TABLE) or (DB.TABLE)
-            m = re.search(r'\(([^)]+)\)', caption)
-            if m:
-                parts = m.group(1).split(".")
-                if len(parts) >= 2:
+    if not info["db_type"] or not info["database"]:
+        for nc in ds_element.findall(".//named-connections/named-connection"):
+            c = nc.find("connection")
+            if c is not None:
+                cls = c.get("class", c.get("dbclass", "")).lower()
+                if cls and cls != "federated":
+                    if not info["db_type"]:
+                        info["db_type"] = cls
                     if not info["database"]:
-                        info["database"] = parts[0].strip()
-                    if len(parts) >= 3:
-                        if not info["schema"]:
-                            info["schema"] = parts[1].strip()
-                        info["table"] = parts[2].strip()
-                    else:
-                        info["table"] = parts[1].strip()
-                elif len(parts) == 1:
-                    info["table"] = parts[0].strip()
-            # If no parens, use the caption text before any space as the name
-            if not info["table"]:
-                info["table"] = caption.split("(")[0].strip()
-
-        # Also check if it looks like a view based on the extracted table name
-        if info["table"]:
-            name_upper = info["table"].upper()
-            if (name_upper.endswith("_VIEW") or name_upper.endswith("_VW")
-                    or name_upper.startswith("V_") or name_upper.startswith("VW_")):
-                info["is_view"] = True
-
-    # ── Step 7: Schema from caption if still missing ──
-    # Caption pattern "CAPTION (DB.SCHEMA.TABLE) (PUBLISHED)" — already handled above.
-    # One more fallback: if db_type is known but schema still blank, try
-    # extracting schema from the datasource name (federated.xxxxx has no schema).
-    # Nothing more we can do without the actual XML — leave blank.
+                        info["database"] = c.get("dbname", c.get("database", ""))
+                    if not info["schema"]:
+                        info["schema"] = c.get("schema", "")
+                    if not info["server"]:
+                        info["server"] = c.get("server", "")
+                    break
 
     return info
 
@@ -215,8 +168,7 @@ def parse_workbook(filepath: Path):
                 ds = datasources.get(ref, {})
                 label = ds.get("ds_caption") or ds.get("ds_name") or ref
                 rows.append({
-                    "workbook":   workbook_name,
-                    "worksheet":  ws_name,
+                    "workbook":   workbook_name, "worksheet":  ws_name,
                     "ds_label":   label,
                     "db_type":    ds.get("db_type", ""),
                     "server":     ds.get("server", ""),
@@ -233,20 +185,18 @@ def parse_workbook(filepath: Path):
 #  EXCEL
 # ─────────────────────────────────────────────
 
-# Colour palette
-_GREEN_DARK  = "0D2B1A"   # workbook fill
-_GREEN_MID   = "34D399"   # workbook accent / header
-_BLUE_DARK   = "0E1F35"   # worksheet fill
-_BLUE_MID    = "4F8EF7"   # worksheet accent
-_CORAL_DARK  = "2A1220"   # source fill
-_CORAL_MID   = "F87171"   # source accent
-_YELLOW_DARK = "2A2010"   # custom sql fill
-_YELLOW_MID  = "FBBF24"   # custom sql accent
-_GREY_DARK   = "1A1D27"   # no source fill
-_GREY_MID    = "6B7280"   # no source accent
-_HEADER_BG   = "1A3D2B"   # header row background (deep green)
-_HEADER_FG   = "6EE7B7"   # header row text
-_ROW_ALT     = "F0FDF4"   # alternating row tint (light green — works on white bg)
+_GREEN_DARK  = "0D2B1A"
+_HEADER_BG   = "1A3D2B"
+_HEADER_FG   = "6EE7B7"
+_CORAL_DARK  = "2A1220"
+_CORAL_MID   = "F87171"
+_BLUE_DARK   = "0E1F35"
+_BLUE_MID    = "4F8EF7"
+_YELLOW_DARK = "2A2010"
+_YELLOW_MID  = "FBBF24"
+_GREY_DARK   = "1A1D27"
+_GREY_MID    = "6B7280"
+_ROW_ALT     = "F0FDF4"
 _WHITE       = "FFFFFF"
 _DARK_TEXT   = "1F2937"
 
@@ -254,23 +204,10 @@ def _thin_border():
     s = Side(style="thin", color="D1D5DB")
     return Border(left=s, right=s, top=s, bottom=s)
 
-def _header_font():
-    return Font(name="Arial", bold=True, color=_HEADER_FG, size=10)
-
-def _body_font(bold=False, color=_DARK_TEXT):
-    return Font(name="Arial", bold=bold, color=color, size=9)
-
 def _fill(hex_color):
     return PatternFill("solid", fgColor=hex_color)
 
-def _center():
-    return Alignment(horizontal="center", vertical="center", wrap_text=False)
-
-def _left():
-    return Alignment(horizontal="left", vertical="center", wrap_text=False)
-
 def _autofit_columns(ws, min_width=10, max_width=60):
-    """Set each column width to fit its longest cell value."""
     for col_cells in ws.columns:
         max_len = 0
         col_letter = get_column_letter(col_cells[0].column)
@@ -282,32 +219,28 @@ def _autofit_columns(ws, min_width=10, max_width=60):
 def _style_header_row(ws, num_cols):
     for col in range(1, num_cols + 1):
         cell = ws.cell(row=1, column=col)
-        cell.font      = _header_font()
+        cell.font      = Font(name="Arial", bold=True, color=_HEADER_FG, size=10)
         cell.fill      = _fill(_HEADER_BG)
-        cell.alignment = _center()
+        cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border    = _thin_border()
 
 def _object_type_style(obj_type):
-    """Return (fill_hex, font_color_hex) based on object type string."""
     t = obj_type.lower()
     if "custom sql" in t: return _YELLOW_DARK, _YELLOW_MID
     if "view"       in t: return _CORAL_DARK,  _CORAL_MID
     if "table"      in t: return _BLUE_DARK,   _BLUE_MID
     return _GREY_DARK, _GREY_MID
 
-
 def write_xlsx(rows, path: Path):
     if not HAS_OPENPYXL:
-        print("  ⚠  openpyxl not installed — skipping Excel output.")
-        print("     Run: pip install openpyxl")
+        print("  ⚠  openpyxl not installed. Run: pip install openpyxl")
         return
 
     wb = Workbook()
 
-    # ── Sheet 1: Full Lineage ──────────────────────────────────
+    # ── Sheet 1: Full Lineage ──
     ws1 = wb.active
     ws1.title = "Full Lineage"
-
     headers = ["Workbook", "Worksheet", "Datasource", "DB Type",
                "Database", "Schema", "Table / View", "Object Type", "Custom SQL"]
     ws1.append(headers)
@@ -315,65 +248,49 @@ def write_xlsx(rows, path: Path):
     ws1.freeze_panes = "A2"
 
     for i, r in enumerate(rows, start=2):
-        fp_parts = [r.get("database",""), r.get("schema",""), r.get("table","")]
-        table_val = ".".join(p for p in fp_parts if p) or r.get("table","") or "—"
+        fp = ".".join(p for p in [r.get("database",""), r.get("schema",""), r.get("table","")] if p)
+        table_val = fp or r.get("table","") or "—"
         obj_type  = ("Custom SQL" if r.get("custom_sql")
                      else "View"  if r.get("is_view")
                      else "Table" if r.get("table") and r.get("table") != "(no datasource found)"
                      else "—")
-
         row_data = [
-            r.get("workbook",""),
-            r.get("worksheet",""),
-            r.get("ds_label",""),
+            r.get("workbook",""), r.get("worksheet",""), r.get("ds_label",""),
             r.get("db_type","").upper() or "—",
-            r.get("database","") or "—",
-            r.get("schema","")   or "—",
-            table_val,
-            obj_type,
+            r.get("database","") or "—", r.get("schema","") or "—",
+            table_val, obj_type,
             "Yes" if r.get("custom_sql") else "No",
         ]
         ws1.append(row_data)
-
-        # Alternating row background
         row_fill = _fill(_ROW_ALT) if i % 2 == 0 else _fill(_WHITE)
-
         for col, val in enumerate(row_data, start=1):
             cell = ws1.cell(row=i, column=col)
             cell.border    = _thin_border()
-            cell.alignment = _left()
-
-            # Object Type column (col 8) gets colour-coded chip style
+            cell.alignment = Alignment(horizontal="left", vertical="center")
             if col == 8:
                 bg, fg = _object_type_style(obj_type)
                 cell.fill = _fill(bg)
-                cell.font = _body_font(bold=True, color=fg)
-            # Workbook column bold
+                cell.font = Font(name="Arial", bold=True, color=fg, size=9)
             elif col == 1:
                 cell.fill = row_fill
-                cell.font = _body_font(bold=True)
-            # Custom SQL yes/no
+                cell.font = Font(name="Arial", bold=True, color=_DARK_TEXT, size=9)
             elif col == 9:
                 cell.fill = _fill(_YELLOW_DARK) if val == "Yes" else row_fill
-                cell.font = _body_font(color=_YELLOW_MID if val == "Yes" else _DARK_TEXT)
+                cell.font = Font(name="Arial", color=_YELLOW_MID if val == "Yes" else _DARK_TEXT, size=9)
             else:
                 cell.fill = row_fill
-                cell.font = _body_font()
-
+                cell.font = Font(name="Arial", color=_DARK_TEXT, size=9)
     _autofit_columns(ws1)
 
-    # ── Sheet 2: Summary by Workbook ──────────────────────────
+    # ── Sheet 2: Summary ──
     ws2 = wb.create_sheet("Summary")
-
     sum_headers = ["Workbook", "Total Worksheets", "Total Datasources",
                    "Unique Tables/Views", "Custom SQL Count", "No-Source Sheets"]
     ws2.append(sum_headers)
     _style_header_row(ws2, len(sum_headers))
     ws2.freeze_panes = "A2"
 
-    # Aggregate
-    from collections import defaultdict as dd
-    agg = dd(lambda: {"sheets": set(), "ds": set(), "tables": set(), "sql": 0, "orphans": 0})
+    agg = defaultdict(lambda: {"sheets": set(), "ds": set(), "tables": set(), "sql": 0, "orphans": 0})
     for r in rows:
         wb_name = r.get("workbook","")
         agg[wb_name]["sheets"].add(r.get("worksheet",""))
@@ -386,34 +303,25 @@ def write_xlsx(rows, path: Path):
             agg[wb_name]["orphans"] += 1
 
     for i, (wb_name, data) in enumerate(sorted(agg.items()), start=2):
-        row_data = [
-            wb_name,
-            len(data["sheets"]),
-            len(data["ds"]),
-            len(data["tables"]),
-            data["sql"],
-            data["orphans"],
-        ]
+        row_data = [wb_name, len(data["sheets"]), len(data["ds"]),
+                    len(data["tables"]), data["sql"], data["orphans"]]
         ws2.append(row_data)
         row_fill = _fill(_ROW_ALT) if i % 2 == 0 else _fill(_WHITE)
         for col, val in enumerate(row_data, start=1):
             cell = ws2.cell(row=i, column=col)
             cell.border    = _thin_border()
-            cell.alignment = _left() if col == 1 else _center()
+            cell.alignment = Alignment(horizontal="left" if col == 1 else "center", vertical="center")
             cell.fill      = row_fill
-            cell.font      = _body_font(bold=(col == 1))
-            # Flag orphan count in red if > 0
-            if col == 6 and isinstance(val, int) and val > 0:
-                cell.font = _body_font(bold=True, color="F87171")
-
+            cell.font      = Font(name="Arial", bold=(col == 1),
+                                  color="F87171" if col == 6 and isinstance(val, int) and val > 0 else _DARK_TEXT,
+                                  size=9)
     _autofit_columns(ws2)
 
-    # ── Sheet 3: Cleanup — No-Source Worksheets ───────────────
+    # ── Sheet 3: No-Source Sheets ──
     ws3 = wb.create_sheet("No-Source Sheets")
     ws3.append(["Workbook", "Worksheet"])
     _style_header_row(ws3, 2)
     ws3.freeze_panes = "A2"
-
     orphans = [r for r in rows if r.get("ds_label") == "(no datasource found)"]
     if orphans:
         for i, r in enumerate(orphans, start=2):
@@ -422,12 +330,11 @@ def write_xlsx(rows, path: Path):
             for col in range(1, 3):
                 cell = ws3.cell(row=i, column=col)
                 cell.border    = _thin_border()
-                cell.alignment = _left()
+                cell.alignment = Alignment(horizontal="left", vertical="center")
                 cell.fill      = row_fill
-                cell.font      = _body_font(bold=(col == 1))
+                cell.font      = Font(name="Arial", bold=(col == 1), color=_DARK_TEXT, size=9)
     else:
         ws3.append(["✅ No worksheets without a datasource found.", ""])
-
     _autofit_columns(ws3)
 
     wb.save(path)
@@ -440,7 +347,6 @@ def write_xlsx(rows, path: Path):
 
 def build_html(rows, path: Path):
 
-    # ── Tree nodes ──
     tree_data = defaultdict(lambda: defaultdict(list))
     for r in rows:
         tree_data[r["workbook"]][r["worksheet"]].append(r)
@@ -464,7 +370,6 @@ def build_html(rows, path: Path):
         nodes.append({"workbook": wb, "sheets": ws_nodes,
                       "table_count": len(all_tables), "sheet_count": len(sheets)})
 
-    # ── Flat table rows ──
     table_rows = []
     for r in rows:
         fp = ".".join(filter(None, [r["database"], r["schema"], r["table"]]))
@@ -476,7 +381,6 @@ def build_html(rows, path: Path):
             "custom_sql": "Yes" if r["custom_sql"] else "No",
         })
 
-    # ── Impact ──
     impact_map = defaultdict(list)
     for r in rows:
         if r["ds_label"] == "(no datasource found)": continue
@@ -501,7 +405,6 @@ def build_html(rows, path: Path):
             "sample_path": deduped[0]["full_path"] if deduped else "—",
         })
 
-    # ── Cleanup ──
     orphans = [{"workbook": r["workbook"], "worksheet": r["worksheet"]}
                for r in rows if r["ds_label"] == "(no datasource found)"]
     ds_table_map = defaultdict(list)
@@ -538,12 +441,11 @@ def build_html(rows, path: Path):
 <style>
 :root{{
   --bg:#0f1117;--surface:#1a1d27;--surface2:#22263a;--border:#2e3348;
-  --wb-fill:#0d2b1a;    --wb-stroke:#34d399;   --wb-text:#6ee7b7;
-  --ws-fill:#0e1f35;    --ws-stroke:#4f8ef7;   --ws-text:#93c5fd;
-  --src-fill:#2a1220;   --src-stroke:#f87171;  --src-text:#fca5a5;
-  --view-fill:#2a1220;  --view-stroke:#fb7185; --view-text:#fda4af;
-  --sql-fill:#2a2010;   --sql-stroke:#fbbf24;  --sql-text:#fde68a;
-  --none-fill:#1a1d27;  --none-stroke:#374151; --none-text:#6b7280;
+  --wb-stroke:#34d399;--wb-text:#6ee7b7;
+  --ws-stroke:#4f8ef7;--ws-text:#93c5fd;
+  --src-stroke:#f87171;--src-text:#fca5a5;
+  --sql-stroke:#fbbf24;--sql-text:#fde68a;
+  --none-stroke:#374151;--none-text:#6b7280;
   --green:#34d399;--accent:#4f8ef7;--yellow:#fbbf24;
   --red:#f87171;--orange:#fb923c;--coral:#fb7185;
   --text:#e2e8f0;--muted:#8892a4;
@@ -563,14 +465,12 @@ header h1 span{{color:var(--green)}}
 .tab:hover{{color:var(--text)}}.tab.active{{color:var(--green);border-bottom-color:var(--green)}}
 main{{padding:24px 32px;max-width:1600px}}
 .view{{display:none}}.view.active{{display:block}}
-/* Stats */
 .stats{{display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap}}
 .stat-card{{background:var(--surface);border:1px solid var(--border);border-radius:8px;
   padding:14px 20px;flex:1;min-width:130px}}
 .stat-card .num{{font-size:26px;font-weight:700;color:var(--green)}}
 .stat-card .lbl{{font-size:12px;color:var(--muted);margin-top:2px}}
 .stat-card.warn .num{{color:var(--orange)}}.stat-card.danger .num{{color:var(--red)}}
-/* Tree */
 .wb-card{{background:var(--surface);border:1px solid var(--wb-stroke);border-radius:10px;
   margin-bottom:10px;overflow:hidden;transition:box-shadow .2s}}
 .wb-card:hover{{box-shadow:0 0 0 1px var(--wb-stroke)}}
@@ -598,7 +498,6 @@ main{{padding:24px 32px;max-width:1600px}}
 .badge{{background:var(--surface2);border:1px solid var(--border);border-radius:4px;
   padding:1px 6px;font-size:11px;color:var(--accent);white-space:nowrap}}
 .badge.view-badge{{color:var(--coral);border-color:var(--src-stroke)}}
-/* Table */
 .search-bar{{display:flex;gap:10px;margin-bottom:14px;align-items:center}}
 .search-bar input,.search-bar select{{background:var(--surface);border:1px solid var(--border);
   border-radius:7px;padding:9px 14px;color:var(--text);font-size:13px;outline:none;transition:border-color .15s}}
@@ -615,8 +514,7 @@ td.mono{{font-family:var(--mono);font-size:12px;color:var(--accent)}}
 .chip{{display:inline-block;background:var(--surface2);border:1px solid var(--border);
   border-radius:4px;padding:1px 7px;font-size:11px}}
 .chip.table{{color:var(--coral)}}.chip.view{{color:var(--coral)}}
-.chip.sql{{color:var(--yellow)}}.chip.db{{color:var(--accent2,#a78bfa)}}
-/* Impact */
+.chip.sql{{color:var(--yellow)}}.chip.db{{color:#a78bfa}}
 .impact-search{{margin-bottom:6px}}
 .impact-search input{{width:100%;background:var(--surface);border:1px solid var(--border);
   border-radius:8px;padding:11px 16px;color:var(--text);font-size:14px;outline:none;
@@ -639,7 +537,6 @@ td.mono{{font-family:var(--mono);font-size:12px;color:var(--accent)}}
 .imp-badge.low{{background:rgba(52,211,153,.15);color:var(--green);border:1px solid rgba(52,211,153,.3)}}
 .sql-tag{{background:rgba(251,191,36,.15);color:var(--yellow);border:1px solid rgba(251,191,36,.3);
   border-radius:4px;padding:1px 6px;font-size:11px;margin-left:4px}}
-/* Cleanup */
 .section{{margin-bottom:36px}}
 .section h2{{font-size:15px;font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:8px}}
 .section p{{color:var(--muted);font-size:13px;margin-bottom:14px;line-height:1.6}}
@@ -659,7 +556,6 @@ td.mono{{font-family:var(--mono);font-size:12px;color:var(--accent)}}
   border-radius:99px;padding:2px 10px;font-size:12px;font-weight:600;white-space:nowrap}}
 .empty{{text-align:center;padding:40px;color:var(--muted);font-size:13px}}
 .empty .icon{{font-size:30px;margin-bottom:8px}}
-/* Diagram */
 .diag-toolbar{{display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap}}
 .diag-toolbar select{{background:var(--surface);border:1px solid var(--border);color:var(--text);
   border-radius:7px;padding:9px 14px;font-size:13px;outline:none;cursor:pointer;min-width:280px}}
@@ -669,28 +565,23 @@ td.mono{{font-family:var(--mono);font-size:12px;color:var(--accent)}}
 .btn:hover{{opacity:.85}}
 .btn.secondary{{background:var(--surface2);border:1px solid var(--border);color:var(--text);font-weight:600}}
 .diag-hint{{color:var(--muted);font-size:12px}}
-/* Legend */
 .legend{{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px;
   background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 16px}}
 .legend-item{{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted)}}
 .legend-dot{{width:10px;height:10px;border-radius:3px;flex-shrink:0}}
-.legend-dot.wb{{background:var(--wb-stroke)}}
-.legend-dot.ws{{background:var(--ws-stroke)}}
-.legend-dot.src{{background:var(--src-stroke)}}
-.legend-dot.sql{{background:var(--yellow)}}
+.legend-dot.wb{{background:var(--wb-stroke)}}.legend-dot.ws{{background:var(--ws-stroke)}}
+.legend-dot.src{{background:var(--src-stroke)}}.legend-dot.sql{{background:var(--yellow)}}
 .legend-dot.none{{background:var(--none-stroke)}}
 .diag-scroll{{overflow:auto;background:var(--surface);border:1px solid var(--border);
   border-radius:12px;padding:32px;min-height:300px}}
 </style>
 </head>
 <body>
-
 <header>
   <span style="font-size:24px">📊</span>
   <h1>Tableau <span>Lineage</span> Map</h1>
   <span class="pill" id="top-pill"></span>
 </header>
-
 <div class="tabs">
   <div class="tab active"  onclick="switchTab('tree')">🌲 Tree View</div>
   <div class="tab"         onclick="switchTab('table')">📋 Table View</div>
@@ -698,14 +589,9 @@ td.mono{{font-family:var(--mono);font-size:12px;color:var(--accent)}}
   <div class="tab"         onclick="switchTab('cleanup')">🧹 Cleanup</div>
   <div class="tab"         onclick="switchTab('diagram')">🗺️ Diagrams</div>
 </div>
-
 <main>
   <div class="stats" id="stats"></div>
-
-  <!-- TREE -->
   <div class="view active" id="view-tree"><div id="tree-container"></div></div>
-
-  <!-- TABLE -->
   <div class="view" id="view-table">
     <div class="search-bar">
       <input id="tbl-search" placeholder="Search workbook, worksheet, table…" oninput="filterTable()">
@@ -717,13 +603,9 @@ td.mono{{font-family:var(--mono);font-size:12px;color:var(--accent)}}
       <th>DB Type</th><th>Full Path (DB.Schema.Table)</th><th>Object Type</th>
     </tr></thead><tbody id="tbl-body"></tbody></table>
   </div>
-
-  <!-- IMPACT -->
   <div class="view" id="view-impact">
     <div class="impact-search">
-      <input id="imp-search"
-             placeholder="Type a datasource name or table/view… e.g. ORDERS or SALES_DS"
-             oninput="filterImpact()">
+      <input id="imp-search" placeholder="Type a datasource name or table/view… e.g. ORDERS or SALES_DS" oninput="filterImpact()">
     </div>
     <div class="impact-hint">
       Each card = one datasource. Expand to see every worksheet that depends on it.
@@ -733,8 +615,6 @@ td.mono{{font-family:var(--mono);font-size:12px;color:var(--accent)}}
     <div class="row-count" id="imp-count"></div>
     <div id="imp-container"></div>
   </div>
-
-  <!-- CLEANUP -->
   <div class="view" id="view-cleanup">
     <div class="section">
       <h2>🔴 Worksheets With No Datasource <span id="orphan-badge"></span></h2>
@@ -747,13 +627,9 @@ td.mono{{font-family:var(--mono);font-size:12px;color:var(--accent)}}
       <div id="dupe-container"></div>
     </div>
   </div>
-
-  <!-- DIAGRAMS -->
   <div class="view" id="view-diagram">
     <div class="diag-toolbar">
-      <select id="diag-select" onchange="drawDiagram()">
-        <option value="">— Select a workbook —</option>
-      </select>
+      <select id="diag-select" onchange="drawDiagram()"><option value="">— Select a workbook —</option></select>
       <button class="btn secondary" onclick="prevWorkbook()">← Prev</button>
       <button class="btn secondary" onclick="nextWorkbook()">Next →</button>
       <button class="btn" onclick="saveSVG()">💾 Save as SVG</button>
@@ -775,7 +651,6 @@ td.mono{{font-family:var(--mono);font-size:12px;color:var(--accent)}}
     </div>
   </div>
 </main>
-
 <script>
 const TREE    = {data_json};
 const ROWS    = {table_json};
@@ -783,7 +658,6 @@ const IMPACT  = {impact_json};
 const ORPHANS = {orphan_json};
 const DUPES   = {dupes_json};
 
-// ── Colour palette (matches CSS vars) ──
 const C = {{
   wb:   {{ fill:'#0d2b1a', stroke:'#34d399', text:'#6ee7b7' }},
   ws:   {{ fill:'#0e1f35', stroke:'#4f8ef7', text:'#93c5fd' }},
@@ -791,10 +665,8 @@ const C = {{
   sql:  {{ fill:'#2a2010', stroke:'#fbbf24', text:'#fde68a' }},
   none: {{ fill:'#1a1d27', stroke:'#374151', text:'#6b7280' }},
   edge: '#2e3348', bg: '#0f1117',
-  path: '#4f8ef7',
 }};
 
-// ── Stats ──────────────────────────────────────
 function renderStats() {{
   const wbs    = new Set(ROWS.map(r=>r.workbook)).size;
   const sheets = new Set(ROWS.map(r=>r.workbook+'|'+r.worksheet)).size;
@@ -811,102 +683,81 @@ function renderStats() {{
   `;
 }}
 
-// ── Tree ───────────────────────────────────────
 function renderTree() {{
   document.getElementById('tree-container').innerHTML = TREE.map((wb,wi) => `
     <div class="wb-card">
       <div class="wb-hdr" onclick="toggleEl('wbb-${{wi}}',this)">
-        <span>📁</span>
-        <span class="wb-name">${{wb.workbook}}</span>
-        <span class="wb-meta">
-          <span>${{wb.sheet_count}} sheet${{wb.sheet_count!==1?'s':''}}</span>
-          <span>·</span>
-          <span>${{wb.table_count}} unique table${{wb.table_count!==1?'s':''}}</span>
-        </span>
+        <span>📁</span><span class="wb-name">${{wb.workbook}}</span>
+        <span class="wb-meta"><span>${{wb.sheet_count}} sheet${{wb.sheet_count!==1?'s':''}}</span><span>·</span><span>${{wb.table_count}} unique table${{wb.table_count!==1?'s':''}}</span></span>
         <span class="caret">▶</span>
       </div>
       <div class="wb-body" id="wbb-${{wi}}">
         ${{wb.sheets.map((ws,si) => `
           <div class="ws-row">
             <div class="ws-lbl" onclick="toggleEl('wss-${{wi}}-${{si}}',this)">
-              <span class="ws-caret">▶</span>
-              <span class="ws-name">📄 ${{ws.name}}</span>
+              <span class="ws-caret">▶</span><span class="ws-name">📄 ${{ws.name}}</span>
               <span style="color:var(--muted);font-size:11px;margin-left:6px">(${{ws.sources.length}} source${{ws.sources.length!==1?'s':''}})</span>
             </div>
             <div class="ws-srcs" id="wss-${{wi}}-${{si}}">
-              ${{ws.sources.map(s => {{
-                const typ = s.custom_sql?'sql': (!s.table||s.table==='—')?'none': s.is_view?'view':'table';
-                return `
-                  <div class="src-row">
-                    <span class="dot ${{typ}}"></span>
-                    <div class="src-info">
-                      <div class="src-lbl">${{s.label}}</div>
-                      <div class="src-path">${{s.table}}</div>
-                      ${{s.custom_sql?`<div class="src-sql">⚡ Custom SQL: ${{s.custom_sql}}</div>`:''}}
-                    </div>
-                    <div style="display:flex;flex-direction:column;gap:3px;align-items:flex-end">
-                      ${{s.db_type?`<span class="badge">${{s.db_type.toUpperCase()}}</span>`:''}}
-                      ${{s.is_view?`<span class="badge view-badge">VIEW</span>`:''}}
-                    </div>
-                  </div>`;
+              ${{ws.sources.map(s=>{{
+                const typ=s.custom_sql?'sql':(!s.table||s.table==='—')?'none':s.is_view?'view':'table';
+                return `<div class="src-row">
+                  <span class="dot ${{typ}}"></span>
+                  <div class="src-info">
+                    <div class="src-lbl">${{s.label}}</div>
+                    <div class="src-path">${{s.table}}</div>
+                    ${{s.custom_sql?`<div class="src-sql">⚡ Custom SQL: ${{s.custom_sql}}</div>`:''}}
+                  </div>
+                  <div style="display:flex;flex-direction:column;gap:3px;align-items:flex-end">
+                    ${{s.db_type?`<span class="badge">${{s.db_type.toUpperCase()}}</span>`:''}}
+                    ${{s.is_view?`<span class="badge view-badge">VIEW</span>`:''}}
+                  </div>
+                </div>`;
               }}).join('')}}
             </div>
-          </div>
-        `).join('')}}
+          </div>`).join('')}}
       </div>
-    </div>
-  `).join('');
+    </div>`).join('');
 }}
-function toggleEl(bodyId,hdrEl) {{
+function toggleEl(bodyId,hdrEl){{
   const body=document.getElementById(bodyId);
   const open=body.classList.toggle('open');
-  if (hdrEl) hdrEl.classList.toggle('open',open);
+  if(hdrEl) hdrEl.classList.toggle('open',open);
 }}
 
-// ── Table ──────────────────────────────────────
-function renderTable(rows) {{
+function renderTable(rows){{
   const tbody=document.getElementById('tbl-body');
   document.getElementById('tbl-count').textContent=rows.length+' row'+(rows.length!==1?'s':'');
-  if (!rows.length) {{
-    tbody.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:32px">No results found</td></tr>';
-    return;
-  }}
-  tbody.innerHTML=rows.map(r=>`
-    <tr>
-      <td><strong>${{r.workbook}}</strong></td>
-      <td>${{r.worksheet}}</td>
-      <td>${{r.datasource}}</td>
-      <td><span class="chip db">${{r.db_type}}</span></td>
-      <td class="mono">${{r.full_path}}</td>
-      <td><span class="chip ${{r.is_view.toLowerCase()}}">${{r.is_view}}</span></td>
-    </tr>
-  `).join('');
+  if(!rows.length){{tbody.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:32px">No results found</td></tr>';return;}}
+  tbody.innerHTML=rows.map(r=>`<tr>
+    <td><strong>${{r.workbook}}</strong></td><td>${{r.worksheet}}</td><td>${{r.datasource}}</td>
+    <td><span class="chip db">${{r.db_type}}</span></td>
+    <td class="mono">${{r.full_path}}</td>
+    <td><span class="chip ${{r.is_view.toLowerCase()}}">${{r.is_view}}</span></td>
+  </tr>`).join('');
 }}
-function filterTable() {{
+function filterTable(){{
   const q=document.getElementById('tbl-search').value.toLowerCase();
   const wb=document.getElementById('tbl-wb').value;
   renderTable(ROWS.filter(r=>(!wb||r.workbook===wb)&&(!q||Object.values(r).some(v=>String(v).toLowerCase().includes(q)))));
 }}
-function populateWBFilter() {{
+function populateWBFilter(){{
   const sel=document.getElementById('tbl-wb');
   [...new Set(ROWS.map(r=>r.workbook))].sort().forEach(wb=>{{
-    const o=document.createElement('option');
-    o.value=wb;o.textContent=wb;sel.appendChild(o);
+    const o=document.createElement('option');o.value=wb;o.textContent=wb;sel.appendChild(o);
   }});
 }}
 
-// ── Impact ─────────────────────────────────────
 function badgeClass(n){{return n>=10?'high':n>=4?'med':'low';}}
-function renderImpact(items) {{
+function renderImpact(items){{
   document.getElementById('imp-count').textContent=items.length+' datasource'+(items.length!==1?'s':'')+' found';
   const c=document.getElementById('imp-container');
-  if (!items.length){{c.innerHTML='<div class="empty"><div class="icon">🔍</div>No matching datasources.</div>';return;}}
+  if(!items.length){{c.innerHTML='<div class="empty"><div class="icon">🔍</div>No matching datasources.</div>';return;}}
   c.innerHTML=items.map((item,i)=>`
     <div class="imp-card">
       <div class="imp-hdr" onclick="toggleImp(${{i}})">
         <span style="font-size:16px">🗄️</span>
-        <div style="flex:1;min-width:0">
-          <div class="imp-ds">${{item.ds_label}}</div>
+        <div style="flex:1;min-width:0"><div class="imp-ds">${{item.ds_label}}</div>
           ${{item.sample_path!=='—'?`<div class="imp-path">${{item.sample_path}}</div>`:''}}
         </div>
         <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
@@ -916,16 +767,12 @@ function renderImpact(items) {{
         </div>
       </div>
       <div class="imp-body" id="icb-${{i}}">
-        ${{item.affected.map(a=>`
-          <div class="imp-ws-row">
-            <span class="imp-wb">📁 ${{a.workbook}}</span>
-            <span>📄 ${{a.worksheet}}</span>
-            ${{a.custom_sql?'<span class="sql-tag">Custom SQL</span>':''}}
-          </div>
-        `).join('')}}
+        ${{item.affected.map(a=>`<div class="imp-ws-row">
+          <span class="imp-wb">📁 ${{a.workbook}}</span><span>📄 ${{a.worksheet}}</span>
+          ${{a.custom_sql?'<span class="sql-tag">Custom SQL</span>':''}}
+        </div>`).join('')}}
       </div>
-    </div>
-  `).join('');
+    </div>`).join('');
 }}
 function toggleImp(i){{
   const body=document.getElementById('icb-'+i);
@@ -935,13 +782,11 @@ function toggleImp(i){{
 function filterImpact(){{
   const q=document.getElementById('imp-search').value.toLowerCase().trim();
   renderImpact(!q?IMPACT:IMPACT.filter(item=>
-    item.ds_label.toLowerCase().includes(q)||
-    item.sample_path.toLowerCase().includes(q)||
+    item.ds_label.toLowerCase().includes(q)||item.sample_path.toLowerCase().includes(q)||
     item.affected.some(a=>a.workbook.toLowerCase().includes(q)||a.worksheet.toLowerCase().includes(q))
   ));
 }}
 
-// ── Cleanup ────────────────────────────────────
 function renderCleanup(){{
   document.getElementById('orphan-badge').innerHTML=`<span class="chip src">${{ORPHANS.length}}</span>`;
   document.getElementById('orphan-container').innerHTML=!ORPHANS.length
@@ -961,8 +806,7 @@ function renderCleanup(){{
         <div class="dupe-body" id="dcb-${{i}}">
           ${{d.instances.map(inst=>`<div class="dupe-inst"><span class="dupe-wb">📁 ${{inst.workbook}}</span><span>📄 ${{inst.worksheet}}</span></div>`).join('')}}
         </div>
-      </div>
-    `).join('');
+      </div>`).join('');
 }}
 function toggleDupe(i){{
   const body=document.getElementById('dcb-'+i);
@@ -970,7 +814,6 @@ function toggleDupe(i){{
   document.getElementById('dc-'+i).style.transform=open?'rotate(90deg)':'';
 }}
 
-// ── Tabs ───────────────────────────────────────
 const TABS=['tree','table','impact','cleanup','diagram'];
 function switchTab(name){{
   document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',TABS[i]===name));
@@ -978,246 +821,141 @@ function switchTab(name){{
   document.getElementById('view-'+name).classList.add('active');
 }}
 
-// ══════════════════════════════════════════════
-//  DIAGRAM — LEFT TO RIGHT
-// ══════════════════════════════════════════════
-const SVG_NS = 'http://www.w3.org/2000/svg';
-const COL_W  = [260, 220, 260];  // workbook, worksheet, source column widths
-const ROW_H  = 80;               // taller to fit wrapped label lines
-const V_GAP  = 12;               // vertical gap between sibling nodes
-const H_GAP  = 72;               // horizontal gap between columns
-const PAD    = 28;               // canvas padding
-const CHARS_PER_LINE = 26;       // max chars per line before wrapping
+// ── Diagram ──
+const SVG_NS='http://www.w3.org/2000/svg';
+const COL_W=[260,220,260];
+const ROW_H=80;
+const V_GAP=12;
+const H_GAP=72;
+const PAD=28;
+const CHARS=26;
 
-function svgEl(tag, attrs) {{
-  const el = document.createElementNS(SVG_NS, tag);
-  for (const [k,v] of Object.entries(attrs)) el.setAttribute(k,v);
+function svgEl(tag,attrs){{
+  const el=document.createElementNS(SVG_NS,tag);
+  for(const [k,v] of Object.entries(attrs)) el.setAttribute(k,v);
   return el;
 }}
-function svgLine(parent, x1,y1,x2,y2) {{
-  parent.appendChild(svgEl('path', {{
+function svgLine(parent,x1,y1,x2,y2){{
+  parent.appendChild(svgEl('path',{{
     d:`M ${{x1}} ${{y1}} C ${{(x1+x2)/2}} ${{y1}}, ${{(x1+x2)/2}} ${{y2}}, ${{x2}} ${{y2}}`,
-    stroke: C.edge, 'stroke-width':'1.5', fill:'none'
+    stroke:C.edge,'stroke-width':'1.5',fill:'none'
   }}));
 }}
-function wrapText(s, maxChars) {{
-  if (!s) return ['—', null];
-  if (s.length <= maxChars) return [s, null];
-  let cut = s.lastIndexOf(' ', maxChars);
-  if (cut < maxChars * 0.5) cut = maxChars;
-  const line1 = s.slice(0, cut).trimEnd();
-  let rest = s.slice(cut).trimStart();
-  if (rest.length > maxChars) rest = rest.slice(0, maxChars - 1) + '…';
-  return [line1, rest || null];
+function wrapText(s,max){{
+  if(!s) return ['—',null];
+  if(s.length<=max) return [s,null];
+  let cut=s.lastIndexOf(' ',max);
+  if(cut<max*0.5) cut=max;
+  const l1=s.slice(0,cut).trimEnd();
+  let rest=s.slice(cut).trimStart();
+  if(rest.length>max) rest=rest.slice(0,max-1)+'…';
+  return [l1,rest||null];
 }}
-function trunc(s, n) {{ return s&&s.length>n ? s.slice(0,n-1)+'…' : (s||'—'); }}
-
-function nodeColors(src) {{
-  if (!src) return C.wb;
-  if (src.custom_sql) return C.sql;
-  if (!src.table || src.table==='—') return C.none;
-  return C.src;   // tables AND views both get coral — no more grey
+function nodeColors(src){{
+  if(!src) return C.wb;
+  if(src.custom_sql) return C.sql;
+  if(!src.table||src.table==='—') return C.none;
+  return C.src;
 }}
-
-function drawWorkbookSVG(wb) {{
-  const svg = document.getElementById('diag-svg');
-  svg.innerHTML = '';
-
-  // ── Pre-calculate heights ──
-  // Each worksheet block = sum of its source rows
-  const wsHeights = wb.sheets.map(ws =>
-    Math.max(1, ws.sources.length) * (ROW_H + V_GAP) - V_GAP
-  );
-  const totalH  = wsHeights.reduce((s,h)=>s+h,0) + (wb.sheets.length-1)*V_GAP;
-  const canvasH = totalH + PAD*2;
-  const canvasW = PAD + COL_W[0] + H_GAP + COL_W[1] + H_GAP + COL_W[2] + PAD;
-
-  svg.setAttribute('width', canvasW);
-  svg.setAttribute('height', canvasH);
-  svg.setAttribute('viewBox', `0 0 ${{canvasW}} ${{canvasH}}`);
-  svg.style.display = 'block';
-
-  // Background
-  svg.appendChild(svgEl('rect', {{x:0,y:0,width:canvasW,height:canvasH,fill:C.bg}}));
-
-  const colX = [PAD, PAD+COL_W[0]+H_GAP, PAD+COL_W[0]+H_GAP+COL_W[1]+H_GAP];
-
-  // ── Workbook node ──
-  const wbY  = canvasH/2 - ROW_H/2;
-  const wbCY = wbY + ROW_H/2;
-  const wbRX = colX[0]+COL_W[0]; // right connector
-
-  drawNode(svg, colX[0], wbY, COL_W[0], ROW_H, C.wb, 12,
+function drawNode(svg,x,y,w,h,colors,rx,line1Full,line2,line3,fs1,fs2,tooltip){{
+  const g=svgEl('g',{{}});
+  g.appendChild(svgEl('rect',{{x,y,width:w,height:h,rx,fill:colors.fill,stroke:colors.stroke,'stroke-width':'1.5'}}));
+  if(tooltip){{const t=document.createElementNS(SVG_NS,'title');t.textContent=tooltip;g.appendChild(t);}}
+  const cx=x+12,midY=y+h/2;
+  const [l1a,l1b]=wrapText(line1Full,CHARS);
+  const total=1+(l1b?1:0)+(line2?1:0)+(line3?1:0);
+  const lh=Math.min(16,(h-12)/total);
+  let cy=midY-((total-1)*lh)/2;
+  const mk=(txt,fs,fw,fill,ff)=>{{
+    const t=svgEl('text',{{x:cx,y:cy,'dominant-baseline':'middle',
+      'font-size':fs+'px','font-weight':fw,fill,
+      'font-family':ff||'Segoe UI,sans-serif'}});
+    t.textContent=txt;g.appendChild(t);cy+=lh;
+  }};
+  mk(l1a,fs1,'600',colors.text);
+  if(l1b) mk(l1b,fs1,'600',colors.text);
+  if(line2){{const [p1]=wrapText(line2,CHARS+4);mk(p1,fs2,'400','#4f8ef7','Cascadia Code,monospace');}}
+  if(line3) mk(line3,9,'400',line3.includes('SQL')?'#fbbf24':line3.includes('VIEW')?'#fb7185':'#64748b','Cascadia Code,monospace');
+  svg.appendChild(g);
+}}
+function drawWorkbookSVG(wb){{
+  const svg=document.getElementById('diag-svg');
+  svg.innerHTML='';
+  const wsH=wb.sheets.map(ws=>Math.max(1,ws.sources.length)*(ROW_H+V_GAP)-V_GAP);
+  const totalH=wsH.reduce((s,h)=>s+h,0)+(wb.sheets.length-1)*V_GAP;
+  const canvasH=totalH+PAD*2;
+  const canvasW=PAD+COL_W[0]+H_GAP+COL_W[1]+H_GAP+COL_W[2]+PAD;
+  svg.setAttribute('width',canvasW);svg.setAttribute('height',canvasH);
+  svg.setAttribute('viewBox',`0 0 ${{canvasW}} ${{canvasH}}`);svg.style.display='block';
+  svg.appendChild(svgEl('rect',{{x:0,y:0,width:canvasW,height:canvasH,fill:C.bg}}));
+  const colX=[PAD,PAD+COL_W[0]+H_GAP,PAD+COL_W[0]+H_GAP+COL_W[1]+H_GAP];
+  const wbY=canvasH/2-ROW_H/2,wbCY=wbY+ROW_H/2,wbRX=colX[0]+COL_W[0];
+  drawNode(svg,colX[0],wbY,COL_W[0],ROW_H,C.wb,12,
     '📁 '+wb.workbook,
     wb.sheet_count+' sheet'+(wb.sheet_count!==1?'s':'')+' · '+wb.table_count+' table'+(wb.table_count!==1?'s':''),
-    null, 13, 11, wb.workbook);
-
-  // ── Worksheets + sources ──
-  let curY = PAD;
-  wb.sheets.forEach((ws, wi) => {{
-    const blockH = wsHeights[wi];
-    const wsY    = curY + blockH/2 - ROW_H/2;
-    const wsCY   = wsY + ROW_H/2;
-    const wsLX   = colX[1];          // left connector
-    const wsRX   = colX[1]+COL_W[1]; // right connector
-
-    // Edge wb → ws
-    svgLine(svg, wbRX, wbCY, wsLX, wsCY);
-
-    drawNode(svg, wsLX, wsY, COL_W[1], ROW_H, C.ws, 8,
-      '📄 '+ws.name,
-      ws.sources.length+' source'+(ws.sources.length!==1?'s':''),
-      null, 12, 10, ws.name);
-
-    // ── Sources ──
-    let srcY = curY;
-    const srcs = ws.sources.length ? ws.sources : [{{label:'(no datasource)',table:'',db_type:'',custom_sql:'',is_view:false}}];
-    srcs.forEach(src => {{
-      const sCY = srcY + ROW_H/2;
-      const nc  = nodeColors(src);
-      const typeLabel = src.custom_sql ? '⚡ Custom SQL'
-                      : src.is_view   ? '◈ VIEW'
-                      : src.db_type   ? src.db_type.toUpperCase()
-                      : '';
-
-      // Edge ws → source
-      svgLine(svg, wsRX, wsCY, colX[2], sCY);
-
-      const srcTooltip = [src.label, src.table, typeLabel].filter(Boolean).join('\n');
-      drawNode(svg, colX[2], srcY, COL_W[2], ROW_H, nc, 6,
-        src.label||'(no datasource)',
-        src.table||'—',
-        typeLabel, 11, 10, srcTooltip);
-
-      srcY += ROW_H + V_GAP;
+    null,13,11,wb.workbook);
+  let curY=PAD;
+  wb.sheets.forEach((ws,wi)=>{{
+    const bh=wsH[wi],wsY=curY+bh/2-ROW_H/2,wsCY=wsY+ROW_H/2;
+    const wsLX=colX[1],wsRX=colX[1]+COL_W[1];
+    svgLine(svg,wbRX,wbCY,wsLX,wsCY);
+    drawNode(svg,wsLX,wsY,COL_W[1],ROW_H,C.ws,8,
+      '📄 '+ws.name,ws.sources.length+' source'+(ws.sources.length!==1?'s':''),
+      null,12,10,ws.name);
+    let srcY=curY;
+    const srcs=ws.sources.length?ws.sources:[{{label:'(no datasource)',table:'',db_type:'',custom_sql:'',is_view:false}}];
+    srcs.forEach(src=>{{
+      const sCY=srcY+ROW_H/2,nc=nodeColors(src);
+      const typeLabel=src.custom_sql?'⚡ Custom SQL':src.is_view?'◈ VIEW':src.db_type?src.db_type.toUpperCase():'';
+      svgLine(svg,wsRX,wsCY,colX[2],sCY);
+      const tip=[src.label,src.table,typeLabel].filter(Boolean).join('\\n');
+      drawNode(svg,colX[2],srcY,COL_W[2],ROW_H,nc,6,
+        src.label||'(no datasource)',src.table||'—',typeLabel,11,10,tip);
+      srcY+=ROW_H+V_GAP;
     }});
-
-    curY += blockH + V_GAP;
+    curY+=bh+V_GAP;
   }});
-
   document.getElementById('diag-placeholder').style.display='none';
-  document.getElementById('diag-hint').textContent =
+  document.getElementById('diag-hint').textContent=
     wb.sheet_count+' worksheet'+(wb.sheet_count!==1?'s':'')+
     ' · '+wb.table_count+' unique table'+(wb.table_count!==1?'s':'');
 }}
-
-function drawNode(svg, x, y, w, h, colors, rx, line1Full, line2, line3, fs1, fs2, tooltip) {{
-  const g = svgEl('g', {{}});
-  g.appendChild(svgEl('rect', {{
-    x, y, width:w, height:h, rx,
-    fill:colors.fill, stroke:colors.stroke, 'stroke-width':'1.5'
-  }}));
-  // Tooltip — shows full text on hover
-  if (tooltip) {{
-    const titleEl = document.createElementNS(SVG_NS, 'title');
-    titleEl.textContent = tooltip;
-    g.appendChild(titleEl);
-  }}
-  const cx   = x + 12;
-  const midY = y + h/2;
-  const [l1a, l1b] = wrapText(line1Full, CHARS_PER_LINE);
-  const totalSlots = 1 + (l1b?1:0) + (line2?1:0) + (line3?1:0);
-  const lineH = Math.min(16, (h - 12) / totalSlots);
-  let curY = midY - ((totalSlots - 1) * lineH) / 2;
-  // Label line 1
-  const t1a = svgEl('text', {{x:cx, y:curY,
-    'dominant-baseline':'middle', 'font-size':fs1+'px',
-    'font-weight':'600', fill:colors.text, 'font-family':'Segoe UI,sans-serif'}});
-  t1a.textContent = l1a;
-  g.appendChild(t1a);
-  curY += lineH;
-  // Label line 2 (wrapped overflow)
-  if (l1b) {{
-    const t1b = svgEl('text', {{x:cx, y:curY,
-      'dominant-baseline':'middle', 'font-size':fs1+'px',
-      'font-weight':'600', fill:colors.text, 'font-family':'Segoe UI,sans-serif'}});
-    t1b.textContent = l1b;
-    g.appendChild(t1b);
-    curY += lineH;
-  }}
-  // Path / subtitle
-  if (line2) {{
-    const [p1] = wrapText(line2, CHARS_PER_LINE + 4);
-    const t2 = svgEl('text', {{x:cx, y:curY,
-      'dominant-baseline':'middle', 'font-size':fs2+'px',
-      fill:'#4f8ef7', 'font-family':'Cascadia Code,Fira Code,monospace'}});
-    t2.textContent = p1;
-    g.appendChild(t2);
-    curY += lineH;
-  }}
-  // Badge (db type / SQL / VIEW)
-  if (line3) {{
-    const t3 = svgEl('text', {{x:cx, y:curY,
-      'dominant-baseline':'middle', 'font-size':'9px',
-      fill: line3.includes('SQL') ? '#fbbf24' : line3.includes('VIEW') ? '#fb7185' : '#64748b',
-      'font-family':'Cascadia Code,Fira Code,monospace'}});
-    t3.textContent = line3;
-    g.appendChild(t3);
-  }}
-  svg.appendChild(g);
-}}
-
-function drawDiagram() {{
+function drawDiagram(){{
   const sel=document.getElementById('diag-select');
   const idx=parseInt(sel.value);
-  if (isNaN(idx)) {{
+  if(isNaN(idx)){{
     document.getElementById('diag-svg').style.display='none';
     document.getElementById('diag-placeholder').style.display='block';
-    document.getElementById('diag-hint').textContent='';
-    return;
+    document.getElementById('diag-hint').textContent='';return;
   }}
   drawWorkbookSVG(TREE[idx]);
 }}
-
-function currentIdx() {{
-  const v=document.getElementById('diag-select').value;
-  return v===''?-1:parseInt(v);
-}}
-function prevWorkbook() {{
-  const i=currentIdx(), sel=document.getElementById('diag-select');
-  if (i>0){{sel.value=i-1;drawDiagram();}}
-  else if (i===-1&&TREE.length>0){{sel.value=TREE.length-1;drawDiagram();}}
-}}
-function nextWorkbook() {{
-  const i=currentIdx(), sel=document.getElementById('diag-select');
-  if (i<TREE.length-1){{sel.value=i+1;drawDiagram();}}
-  else if (i===-1&&TREE.length>0){{sel.value=0;drawDiagram();}}
-}}
-
-function saveSVG() {{
+function currentIdx(){{const v=document.getElementById('diag-select').value;return v===''?-1:parseInt(v);}}
+function prevWorkbook(){{const i=currentIdx(),sel=document.getElementById('diag-select');
+  if(i>0){{sel.value=i-1;drawDiagram();}}else if(i===-1&&TREE.length>0){{sel.value=TREE.length-1;drawDiagram();}}}}
+function nextWorkbook(){{const i=currentIdx(),sel=document.getElementById('diag-select');
+  if(i<TREE.length-1){{sel.value=i+1;drawDiagram();}}else if(i===-1&&TREE.length>0){{sel.value=0;drawDiagram();}}}}
+function saveSVG(){{
   const svg=document.getElementById('diag-svg');
-  if (svg.style.display==='none'){{alert('Please select a workbook first.');return;}}
-  const sel=document.getElementById('diag-select');
-  const wb=TREE[parseInt(sel.value)];
+  if(svg.style.display==='none'){{alert('Please select a workbook first.');return;}}
+  const wb=TREE[parseInt(document.getElementById('diag-select').value)];
   const name=(wb?wb.workbook:'diagram').replace(/[^a-z0-9_-]/gi,'_');
-  const blob=new Blob(
-    ['<?xml version="1.0" encoding="UTF-8"?>'+svg.outerHTML],
-    {{type:'image/svg+xml'}}
-  );
+  const blob=new Blob(['<?xml version="1.0" encoding="UTF-8"?>'+svg.outerHTML],{{type:'image/svg+xml'}});
   const url=URL.createObjectURL(blob);
-  const a=document.createElement('a');
-  a.href=url;a.download=name+'_lineage.svg';a.click();
+  const a=document.createElement('a');a.href=url;a.download=name+'_lineage.svg';a.click();
   URL.revokeObjectURL(url);
 }}
-
-function populateDiagSelect() {{
+function populateDiagSelect(){{
   const sel=document.getElementById('diag-select');
   TREE.forEach((wb,i)=>{{
-    const o=document.createElement('option');
-    o.value=i;
+    const o=document.createElement('option');o.value=i;
     o.textContent=wb.workbook+' ('+wb.sheet_count+' sheets, '+wb.table_count+' tables)';
     sel.appendChild(o);
   }});
 }}
 
-// ── Init ───────────────────────────────────────
-renderStats();
-renderTree();
-populateWBFilter();
-renderTable(ROWS);
-renderImpact(IMPACT);
-renderCleanup();
-populateDiagSelect();
+renderStats();renderTree();populateWBFilter();renderTable(ROWS);
+renderImpact(IMPACT);renderCleanup();populateDiagSelect();
 </script>
 </body>
 </html>"""
