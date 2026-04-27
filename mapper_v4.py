@@ -1,5 +1,5 @@
 """
-Tableau Lineage Mapper v5
+Tableau Lineage Mapper v6
 =========================
 Parses .twb/.twbx files — no Tableau Server required.
 
@@ -11,12 +11,18 @@ Five tabs:
   5. Diagrams         — Left-to-right family tree per workbook (Green→Blue→Coral)
                         Improved Snowflake view detection so views are never grey
 
+Outputs:
+  - tableau_lineage.xlsx  — Formatted Excel workbook with auto-fit columns,
+                            frozen header row, colour-coded object types,
+                            alternating row shading, and a summary sheet
+  - tableau_lineage.html  — Interactive HTML report (all five tabs)
+
 Usage:
     python tableau_lineage_mapper.py --folder /path/to/twb/files
     python tableau_lineage_mapper.py --folder . --output my_report
 
 Requirements:
-    pip install pandas
+    pip install openpyxl
 """
 
 import sys, json, zipfile, argparse
@@ -25,11 +31,12 @@ from pathlib import Path
 from collections import defaultdict
 
 try:
-    import pandas as pd
-    HAS_PANDAS = True
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    HAS_OPENPYXL = True
 except ImportError:
-    import csv
-    HAS_PANDAS = False
+    HAS_OPENPYXL = False
 
 
 # ─────────────────────────────────────────────
@@ -161,17 +168,208 @@ def parse_workbook(filepath: Path):
 
 
 # ─────────────────────────────────────────────
-#  CSV
+#  EXCEL
 # ─────────────────────────────────────────────
 
-def write_csv(rows, path: Path):
-    if HAS_PANDAS:
-        pd.DataFrame(rows).to_csv(path, index=False)
+# Colour palette
+_GREEN_DARK  = "0D2B1A"   # workbook fill
+_GREEN_MID   = "34D399"   # workbook accent / header
+_BLUE_DARK   = "0E1F35"   # worksheet fill
+_BLUE_MID    = "4F8EF7"   # worksheet accent
+_CORAL_DARK  = "2A1220"   # source fill
+_CORAL_MID   = "F87171"   # source accent
+_YELLOW_DARK = "2A2010"   # custom sql fill
+_YELLOW_MID  = "FBBF24"   # custom sql accent
+_GREY_DARK   = "1A1D27"   # no source fill
+_GREY_MID    = "6B7280"   # no source accent
+_HEADER_BG   = "1A3D2B"   # header row background (deep green)
+_HEADER_FG   = "6EE7B7"   # header row text
+_ROW_ALT     = "F0FDF4"   # alternating row tint (light green — works on white bg)
+_WHITE       = "FFFFFF"
+_DARK_TEXT   = "1F2937"
+
+def _thin_border():
+    s = Side(style="thin", color="D1D5DB")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+def _header_font():
+    return Font(name="Arial", bold=True, color=_HEADER_FG, size=10)
+
+def _body_font(bold=False, color=_DARK_TEXT):
+    return Font(name="Arial", bold=bold, color=color, size=9)
+
+def _fill(hex_color):
+    return PatternFill("solid", fgColor=hex_color)
+
+def _center():
+    return Alignment(horizontal="center", vertical="center", wrap_text=False)
+
+def _left():
+    return Alignment(horizontal="left", vertical="center", wrap_text=False)
+
+def _autofit_columns(ws, min_width=10, max_width=60):
+    """Set each column width to fit its longest cell value."""
+    for col_cells in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col_cells[0].column)
+        for cell in col_cells:
+            if cell.value:
+                max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[col_letter].width = min(max(max_len + 3, min_width), max_width)
+
+def _style_header_row(ws, num_cols):
+    for col in range(1, num_cols + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.font      = _header_font()
+        cell.fill      = _fill(_HEADER_BG)
+        cell.alignment = _center()
+        cell.border    = _thin_border()
+
+def _object_type_style(obj_type):
+    """Return (fill_hex, font_color_hex) based on object type string."""
+    t = obj_type.lower()
+    if "custom sql" in t: return _YELLOW_DARK, _YELLOW_MID
+    if "view"       in t: return _CORAL_DARK,  _CORAL_MID
+    if "table"      in t: return _BLUE_DARK,   _BLUE_MID
+    return _GREY_DARK, _GREY_MID
+
+
+def write_xlsx(rows, path: Path):
+    if not HAS_OPENPYXL:
+        print("  ⚠  openpyxl not installed — skipping Excel output.")
+        print("     Run: pip install openpyxl")
+        return
+
+    wb = Workbook()
+
+    # ── Sheet 1: Full Lineage ──────────────────────────────────
+    ws1 = wb.active
+    ws1.title = "Full Lineage"
+
+    headers = ["Workbook", "Worksheet", "Datasource", "DB Type",
+               "Database", "Schema", "Table / View", "Object Type", "Custom SQL"]
+    ws1.append(headers)
+    _style_header_row(ws1, len(headers))
+    ws1.freeze_panes = "A2"
+
+    for i, r in enumerate(rows, start=2):
+        fp_parts = [r.get("database",""), r.get("schema",""), r.get("table","")]
+        table_val = ".".join(p for p in fp_parts if p) or r.get("table","") or "—"
+        obj_type  = ("Custom SQL" if r.get("custom_sql")
+                     else "View"  if r.get("is_view")
+                     else "Table" if r.get("table") and r.get("table") != "(no datasource found)"
+                     else "—")
+
+        row_data = [
+            r.get("workbook",""),
+            r.get("worksheet",""),
+            r.get("ds_label",""),
+            r.get("db_type","").upper() or "—",
+            r.get("database","") or "—",
+            r.get("schema","")   or "—",
+            table_val,
+            obj_type,
+            "Yes" if r.get("custom_sql") else "No",
+        ]
+        ws1.append(row_data)
+
+        # Alternating row background
+        row_fill = _fill(_ROW_ALT) if i % 2 == 0 else _fill(_WHITE)
+
+        for col, val in enumerate(row_data, start=1):
+            cell = ws1.cell(row=i, column=col)
+            cell.border    = _thin_border()
+            cell.alignment = _left()
+
+            # Object Type column (col 8) gets colour-coded chip style
+            if col == 8:
+                bg, fg = _object_type_style(obj_type)
+                cell.fill = _fill(bg)
+                cell.font = _body_font(bold=True, color=fg)
+            # Workbook column bold
+            elif col == 1:
+                cell.fill = row_fill
+                cell.font = _body_font(bold=True)
+            # Custom SQL yes/no
+            elif col == 9:
+                cell.fill = _fill(_YELLOW_DARK) if val == "Yes" else row_fill
+                cell.font = _body_font(color=_YELLOW_MID if val == "Yes" else _DARK_TEXT)
+            else:
+                cell.fill = row_fill
+                cell.font = _body_font()
+
+    _autofit_columns(ws1)
+
+    # ── Sheet 2: Summary by Workbook ──────────────────────────
+    ws2 = wb.create_sheet("Summary")
+
+    sum_headers = ["Workbook", "Total Worksheets", "Total Datasources",
+                   "Unique Tables/Views", "Custom SQL Count", "No-Source Sheets"]
+    ws2.append(sum_headers)
+    _style_header_row(ws2, len(sum_headers))
+    ws2.freeze_panes = "A2"
+
+    # Aggregate
+    from collections import defaultdict as dd
+    agg = dd(lambda: {"sheets": set(), "ds": set(), "tables": set(), "sql": 0, "orphans": 0})
+    for r in rows:
+        wb_name = r.get("workbook","")
+        agg[wb_name]["sheets"].add(r.get("worksheet",""))
+        if r.get("ds_label") != "(no datasource found)":
+            agg[wb_name]["ds"].add(r.get("ds_label",""))
+            fp = ".".join(p for p in [r.get("database",""), r.get("schema",""), r.get("table","")] if p)
+            if fp: agg[wb_name]["tables"].add(fp)
+            if r.get("custom_sql"): agg[wb_name]["sql"] += 1
+        else:
+            agg[wb_name]["orphans"] += 1
+
+    for i, (wb_name, data) in enumerate(sorted(agg.items()), start=2):
+        row_data = [
+            wb_name,
+            len(data["sheets"]),
+            len(data["ds"]),
+            len(data["tables"]),
+            data["sql"],
+            data["orphans"],
+        ]
+        ws2.append(row_data)
+        row_fill = _fill(_ROW_ALT) if i % 2 == 0 else _fill(_WHITE)
+        for col, val in enumerate(row_data, start=1):
+            cell = ws2.cell(row=i, column=col)
+            cell.border    = _thin_border()
+            cell.alignment = _left() if col == 1 else _center()
+            cell.fill      = row_fill
+            cell.font      = _body_font(bold=(col == 1))
+            # Flag orphan count in red if > 0
+            if col == 6 and isinstance(val, int) and val > 0:
+                cell.font = _body_font(bold=True, color="F87171")
+
+    _autofit_columns(ws2)
+
+    # ── Sheet 3: Cleanup — No-Source Worksheets ───────────────
+    ws3 = wb.create_sheet("No-Source Sheets")
+    ws3.append(["Workbook", "Worksheet"])
+    _style_header_row(ws3, 2)
+    ws3.freeze_panes = "A2"
+
+    orphans = [r for r in rows if r.get("ds_label") == "(no datasource found)"]
+    if orphans:
+        for i, r in enumerate(orphans, start=2):
+            ws3.append([r.get("workbook",""), r.get("worksheet","")])
+            row_fill = _fill(_ROW_ALT) if i % 2 == 0 else _fill(_WHITE)
+            for col in range(1, 3):
+                cell = ws3.cell(row=i, column=col)
+                cell.border    = _thin_border()
+                cell.alignment = _left()
+                cell.fill      = row_fill
+                cell.font      = _body_font(bold=(col == 1))
     else:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=rows[0].keys())
-            w.writeheader(); w.writerows(rows)
-    print(f"  ✓ CSV  → {path}")
+        ws3.append(["✅ No worksheets without a datasource found.", ""])
+
+    _autofit_columns(ws3)
+
+    wb.save(path)
+    print(f"  ✓ XLSX → {path}")
 
 
 # ─────────────────────────────────────────────
@@ -965,7 +1163,7 @@ def main():
     if not all_rows:
         print("\nNo data extracted."); sys.exit(1)
 
-    write_csv(all_rows, folder / f"{args.output}.csv")
+    write_xlsx(all_rows, folder / f"{args.output}.xlsx")
     build_html(all_rows, folder / f"{args.output}.html")
     print(f"\nDone. Open {args.output}.html in any browser.")
 
