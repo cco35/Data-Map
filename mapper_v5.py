@@ -44,14 +44,20 @@ except ImportError:
 # ─────────────────────────────────────────────
 
 def _strip_namespaces(content: bytes) -> bytes:
-    """Remove XML namespace declarations so ElementTree xpath works."""
+    """
+    Remove XML namespace declarations and prefixes from raw .twb XML bytes
+    so that ElementTree xpath queries work with plain unprefixed tag names.
+    """
     import re as _re
-    # Remove xmlns='...' and xmlns="..." attributes (single or double quotes)
-    content = _re.sub(rb'\s+xmlns(?::\w+)?=[^\s>]+', b'', content)
-    # Strip namespace prefixes: <ns:tag> -> <tag>, </ns:tag> -> </tag>
-    content = _re.sub(rb'<(/?)\w+:([\w\-]+)', rb'<\1\2', content)
+    # Remove xmlns="..." double-quoted
+    content = _re.sub(rb'\s+xmlns(?::\w+)?="[^"]*"', b'', content)
+    # Remove xmlns='...' single-quoted
+    content = _re.sub(rb"\s+xmlns(?::\w+)?='[^']*'", b'', content)
+    # Strip prefixes from tags: <ns:tag> -> <tag>, </ns:tag> -> </tag>
+    content = _re.sub(rb'<(/?)[\w][\w.-]*:([\w][\w.-]*)', rb'<\1\2', content)
+    # Strip prefixes from attributes: ns:attr="v" -> attr="v"
+    content = _re.sub(rb' [\w][\w.-]*:([\w][\w.-]*)=', rb' \1=', content)
     return content
-
 
 def get_twb_tree(filepath: Path):
     if filepath.suffix.lower() == ".twbx":
